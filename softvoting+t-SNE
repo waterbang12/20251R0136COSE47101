@@ -1,83 +1,76 @@
-
-from google.colab import drive
-
-drive.mount('/content/drive')
-
-import rasterio
-import numpy as np
 import pandas as pd
-import geopandas as gpd
-from shapely.geometry import Point
-from rasterio.transform import xy
+import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import roc_auc_score, classification_report
+from imblearn.over_sampling import SMOTE
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+import xgboost as xgb
+import lightgbm as lgb
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, confusion_matrix
+)
+import shap
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
 
-base_path = '/content/drive/MyDrive/DS_project'
+df = pd.read_csv('/content/drive/MyDrive/DS_project/Total_dataset.csv')
 
+feature_cols = ['DEM','PTF','Precipitation','Slope','Dist_to_Road',
+                'Groundwater_Usage','River_Usage','Groundwater_Level']
+X = df[feature_cols]
+y = df['label']
 
-tif_paths = [
-    f'{base_path}/DEM.tif',
-    f'{base_path}/PTF.tif',
-    f'{base_path}/Rainfall.tif',
-    f'{base_path}/slope.tif',   
-    f'{base_path}/Distance_to_Road.tif',
-    f'{base_path}/Groundwater_Level.tif',
-    f'{base_path}/River_Usage.tif'
-]
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, stratify=y, test_size=0.2, random_state=42
+)
 
-channel_names = [
-    'DEM',
-    'PTF',
-    'Rainfall',        
-    'Slope',             
-    'Distance_to_Road',
-    'Groundwater_Level',
-    'River_Usage'
-]
+smote = SMOTE(random_state=42)
+X_res, y_res = smote.fit_resample(X_train, y_train)
 
-arrays = []
-with rasterio.open(tif_paths[0]) as src0:
-    transform = src0.transform
-    crs = src0.crs
-    nodata = src0.nodata if src0.nodata is not None else -9999
+rf_clf  = RandomForestClassifier(n_estimators=300, class_weight='balanced', random_state=42)
+xgb_clf = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+lgb_clf = lgb.LGBMClassifier(class_weight='balanced', random_state=42)
 
-for path in tif_paths:
-    with rasterio.open(path) as src:
-        arrays.append(src.read(1))
+ensemble = VotingClassifier(
+    estimators=[('rf', rf_clf), ('xgb', xgb_clf), ('lgb', lgb_clf)],
+    voting='soft', n_jobs=-1
+)
+ensemble.fit(X_res, y_res)
 
-stacked = np.stack(arrays, axis=0)
+y_pred  = ensemble.predict(X_test)
+y_proba = ensemble.predict_proba(X_test)[:, 1]
 
+acc  = accuracy_score(y_test, y_pred)
+prec = precision_score(y_test, y_pred)
+rec  = recall_score(y_test, y_pred)
+f1   = f1_score(y_test, y_pred)
+auc  = roc_auc_score(y_test, y_proba)
+tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+spec = tn / (tn + fp)
 
-valid_mask = np.all(stacked != nodata, axis=0)
-rows, cols = np.where(valid_mask)
-xs, ys = xy(transform, rows, cols)
+print("=== Ensemble Performance ===")
+print(f"Accuracy   : {acc:.3f}")
+print(f"Precision  : {prec:.3f}")
+print(f"Recall     : {rec:.3f}")
+print(f"Specificity: {spec:.3f}")
+print(f"F1 Score   : {f1:.3f}")
+print(f"AUC        : {auc:.3f}")
 
+explainer = shap.TreeExplainer(ensemble)
+shap_values = explainer.shap_values(X_test)[1]  # 클래스1 SHAP
+shap.summary_plot(shap_values, X_test, plot_type="bar", max_display=10)
 
-data = {'geometry': [Point(x, y) for x, y in zip(xs, ys)]}
-for i, name in enumerate(channel_names):
-    data[name] = stacked[i, rows, cols]
+global_imp = np.mean(np.abs(shap_values), axis=0)
+suscept = shap_values.dot(global_imp)
 
-gdf = gpd.GeoDataFrame(pd.DataFrame(data), crs=crs)
-gdf['x'] = gdf.geometry.x
-gdf['y'] = gdf.geometry.y
+tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+tsne_embedded = tsne.fit_transform(shap_values)
 
-
-np.random.seed(42)
-gdf['label'] = 0
-gdf.loc[gdf.sample(frac=0.4, random_state=42).index, 'label'] = 1
-
-
-X = gdf[channel_names]
-y = gdf['label']
-X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
-
-clf = RandomForestClassifier(n_estimators=100, random_state=42)
-clf.fit(X_train, y_train)
-y_pred = clf.predict(X_test)
-y_proba = clf.predict_proba(X_test)[:, 1]
-
-auc = roc_auc_score(y_test, y_proba)
-print("AUC:", auc)
-print("\nClassification Report:")
-print(classification_report(y_test, y_pred))
+plt.figure(figsize=(8,6))
+plt.scatter(tsne_embedded[:,0], tsne_embedded[:,1],
+            c=suscept, cmap='plasma', s=5)
+plt.colorbar(label='Susceptibility Index')
+plt.title('t-SNE of SHAP Values (Sinkhole Risk)')
+plt.xlabel('t-SNE 1')
+plt.ylabel('t-SNE 2')
+plt.show()
